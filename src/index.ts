@@ -1,214 +1,112 @@
-import fs from 'fs';
+import * as colors from 'kleur/colors';
 import path from 'path';
-import rimraf from 'rimraf';
-import chalk from 'chalk';
-import ora from 'ora';
 import yargs from 'yargs-parser';
+import {addCommand, rmCommand} from './commands/add-rm';
+import {command as buildCommand} from './commands/build';
+import {command as devCommand} from './commands/dev';
+import {command as installCommand} from './commands/install';
+import {CLIFlags, loadAndValidateConfig} from './config.js';
+import {clearCache, readLockfile} from './util.js';
 
-import * as rollup from 'rollup';
-import rollupPluginNodeResolve from 'rollup-plugin-node-resolve';
-import rollupPluginCommonjs from 'rollup-plugin-commonjs';
-import {terser as rollupPluginTerser} from 'rollup-plugin-terser';
-import rollupPluginReplace from 'rollup-plugin-replace';
-import rollupPluginJson from 'rollup-plugin-json';
-
-export interface InstallOptions {
-  destLoc: string;
-  isCleanInstall?: boolean;
-  isStrict?: boolean;
-  isOptimized?: boolean;
-  skipFailures?: boolean;
-}
+export {install as unstable_installCommand} from './commands/install';
+export {createConfiguration} from './config.js';
 
 const cwd = process.cwd();
-const banner = chalk.bold(`@pika/web`) + ` installing... `;
-const detectionResults = [];
-let spinner = ora(banner);
 
-function showHelp() {
-  console.log(`${chalk.bold(`@pika/web`)} - Install npm dependencies to run natively on the web.`);
-  console.log(`
-  Options
-    --dest      Specify destination directory (default: "web_modules/").
-    --clean     Clear out the destination directory before install.
-    --optimize  Minify installed dependencies.
-    --strict    Only install pure ESM dependency trees. Fail if a CJS module is encountered.
-`);
-}
+function printHelp() {
+  console.log(
+    `
+${colors.bold(`snowpack`)} - A faster build system for the modern web.
 
-function formatDetectionResults(skipFailures): string {
-  return detectionResults.map(([d, yn]) => yn ? chalk.green(d) : skipFailures ? chalk.dim(d) : chalk.red(d)).join(', ');
-}
+  Snowpack is best configured via config file.
+  But, most configuration can also be passed via CLI flags.
+  📖 ${colors.dim('https://www.snowpack.dev/#configuration')}
 
-function logError(msg) {
-  spinner.stopAndPersist({symbol: chalk.cyan('⠼')});
-  spinner = ora(chalk.red(msg));
-  spinner.fail();
-}
+${colors.bold('Commands:')}
+  snowpack dev          Develop your app locally.
+  snowpack build        Build your app for production.
+  snowpack install      (Advanced) Install web-ready dependencies.
 
-
-class ErrorWithHint extends Error {
-  constructor(message: string, public readonly hint: string) {
-    super(message);
-  }
-}
-
-/**
- * Resolve a "webDependencies" input value to the correct absolute file location.
- * Supports both npm package names, and file paths relative to the node_modules directory.
- * Follows logic similar to Node's resolution logic, but using a package.json's ESM "module"
- * field instead of the CJS "main" field.
- */
-function resolveWebDependency(dep: string): string {
-  const nodeModulesLoc = path.join(cwd, 'node_modules', dep);
-  let dependencyStats: fs.Stats;
-  try {
-    dependencyStats = fs.statSync(nodeModulesLoc);
-  } catch (err) {
-    throw new Error(`"${dep}" not found in your node_modules directory. Did you run npm install?`);
-  }
-  if (dependencyStats.isFile()) {
-    return nodeModulesLoc;
-  }
-  if (dependencyStats.isDirectory()) {
-    const dependencyManifestLoc = path.join(nodeModulesLoc, 'package.json');
-    const manifest = require(dependencyManifestLoc);
-    if (!manifest.module) {
-      throw new ErrorWithHint(
-        `dependency "${dep}" has no ES "module" entrypoint.`,
-        chalk.italic(
-          `Tip: Find modern, web-ready packages at ${chalk.underline(
-            'https://pikapkg.com/packages',
-          )}`,
-        ),
-      );
-    }
-    return path.join(nodeModulesLoc, manifest.module);
-  }
-
-  throw new Error(
-    `Error loading "${dep}" at "${nodeModulesLoc}". (MODE=${dependencyStats.mode}) `,
+${colors.bold('Flags:')}
+  --config [path]       Set the location of your project config file.
+  --help                Show this help message.
+  --version             Show the current version.
+  --reload              Clear Snowpack's local cache (troubleshooting).
+    `.trim(),
   );
-}
-
-/**
- * Formats the @pika/web dependency name from a "webDependencies" input value:
- * 2. Remove any ".js" extension (will be added automatically by Rollup)
- */
-function getWebDependencyName(dep: string): string {
-  return dep.replace(/\.js$/, '');
-}
-
-export async function install(
-  arrayOfDeps: string[],
-  {isCleanInstall, destLoc, skipFailures, isStrict, isOptimized}: InstallOptions,
-) {
-  if (arrayOfDeps.length === 0) {
-    logError('no dependencies found.');
-    return;
-  }
-  if (!fs.existsSync(path.join(cwd, 'node_modules'))) {
-    logError('no "node_modules" directory exists. Did you run "npm install" first?');
-    return;
-  }
-
-  if (isCleanInstall) {
-    rimraf.sync(destLoc);
-  }
-
-  const depObject = {};
-  for (const dep of arrayOfDeps) {
-    try {
-      const depName = getWebDependencyName(dep);
-      const depLoc = resolveWebDependency(dep);
-      depObject[depName] = depLoc;
-      detectionResults.push([dep, true]);
-      spinner.text = banner + formatDetectionResults(skipFailures);
-    } catch (err) {
-      detectionResults.push([dep, false]);
-      spinner.text = banner + formatDetectionResults(skipFailures);
-      if (skipFailures) {
-        continue;
-      }
-      // An error occurred! Log it.
-      logError(err.message || err);
-      if (err.hint) {
-        console.log(err.hint);
-      }
-      return false;
-    }
-  }
-
-  const inputOptions = {
-    input: depObject,
-    plugins: [
-      !isStrict &&
-        rollupPluginReplace({
-          'process.env.NODE_ENV': isOptimized ? '"production"' : '"development"',
-        }),
-      rollupPluginNodeResolve({
-        module: true, // Default: true
-        jsnext: false, // Default: false
-        main: !isStrict, // Default: true
-        browser: false, // Default: false
-        modulesOnly: isStrict, // Default: false
-        extensions: ['.mjs', '.js', '.json'], // Default: [ '.mjs', '.js', '.json', '.node' ]
-        // whether to prefer built-in modules (e.g. `fs`, `path`) or local ones with the same names
-        preferBuiltins: false, // Default: true
-      }),
-      !isStrict &&
-        rollupPluginJson({
-          preferConst: true,
-          indent: '  ',
-        }),
-      !isStrict &&
-        rollupPluginCommonjs({
-          extensions: ['.js', '.cjs'], // Default: [ '.js' ]
-        }),
-      isOptimized && rollupPluginTerser(),
-    ],
-  };
-  const outputOptions = {
-    dir: destLoc,
-    format: 'esm' as 'esm',
-    sourcemap: true,
-    exports: 'named' as 'named',
-    chunkFileNames: 'common/[name]-[hash].js',
-  };
-  const packageBundle = await rollup.rollup(inputOptions);
-  await packageBundle.write(outputOptions);
-  return true;
 }
 
 export async function cli(args: string[]) {
-  const {help, optimize = false, strict = false, clean = false, dest = 'web_modules'} = yargs(args);
-  const destLoc = path.join(cwd, dest);
-
-  if (help) {
-    showHelp();
+  // parse CLI flags
+  const cliFlags = yargs(args, {
+    array: ['install', 'env', 'exclude', 'externalPackage'],
+  }) as CLIFlags;
+  if (cliFlags.help) {
+    printHelp();
     process.exit(0);
   }
-
-  const cwdManifest = require(path.join(cwd, 'package.json'));
-  const doesWhitelistExist = !!(
-    cwdManifest['@pika/web'] && cwdManifest['@pika/web'].webDependencies
-  );
-  const arrayOfDeps = doesWhitelistExist
-    ? cwdManifest['@pika/web'].webDependencies
-    : Object.keys(cwdManifest.dependencies || {});
-  spinner.start();
-  const startTime = Date.now();
-  const result = await install(arrayOfDeps, {
-    isCleanInstall: clean,
-    destLoc,
-    skipFailures: !doesWhitelistExist,
-    isStrict: strict,
-    isOptimized: optimize,
-  });
-  if (result) {
-    spinner.succeed(
-      chalk.bold(`@pika/web`) + ` installed: ` + formatDetectionResults(!doesWhitelistExist) + '. ' +
-        chalk.dim(`[${((Date.now() - startTime) / 1000).toFixed(2)}s]`),
-    );
+  if (cliFlags.version) {
+    console.log(require('../package.json').version);
+    process.exit(0);
   }
+  if (cliFlags.reload) {
+    console.log(colors.yellow('! clearing cache...'));
+    await clearCache();
+  }
+
+  // Load the current package manifest
+  let pkgManifest: any;
+  try {
+    pkgManifest = require(path.join(cwd, 'package.json'));
+  } catch (err) {
+    console.log(colors.red('[ERROR] package.json required but no file was found.'));
+    process.exit(1);
+  }
+
+  const cmd = cliFlags['_'][2];
+
+  // Set this early -- before config loading -- so that plugins see it.
+  if (cmd === 'build') {
+    process.env.NODE_ENV = process.env.NODE_ENV || 'production';
+  }
+  if (cmd === 'dev') {
+    process.env.NODE_ENV = process.env.NODE_ENV || 'development';
+  }
+
+  const commandOptions = {
+    cwd,
+    config: loadAndValidateConfig(cliFlags, pkgManifest),
+    lockfile: await readLockfile(cwd),
+    pkgManifest,
+  };
+
+  if (cmd === 'add') {
+    await addCommand(cliFlags['_'][3], commandOptions);
+    return;
+  }
+  if (cmd === 'rm') {
+    await rmCommand(cliFlags['_'][3], commandOptions);
+    return;
+  }
+
+  if (cliFlags['_'].length > 3) {
+    console.log(`Unexpected multiple commands`);
+    process.exit(1);
+  }
+
+  if (cmd === 'build') {
+    await buildCommand(commandOptions);
+    return;
+  }
+  if (cmd === 'dev') {
+    await devCommand(commandOptions);
+    return;
+  }
+  if (cmd === 'install' || !cmd) {
+    await installCommand(commandOptions);
+    return;
+  }
+
+  console.log(`Unrecognized command: ${cmd}`);
+  process.exit(1);
 }
